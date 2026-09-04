@@ -9,7 +9,7 @@ sinh code Google Apps Script để tạo Google Form ABCD
 CÁCH DÙNG:
     python create_form.py
 
-    Nhập: đề số, tên bài trên terminal.
+    Chọn: bài, phần/đề, khoảng câu và tên Form trên terminal.
     → Script sinh file .gs, bạn paste vào script.google.com và chạy.
 
 KHÔNG cần credentials.json, KHÔNG cần Google Cloud Console.
@@ -21,7 +21,10 @@ import re
 import json
 import subprocess
 import base64
+from bisect import bisect_right
 from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Optional
 
 import pdfplumber
 
@@ -41,7 +44,7 @@ ANSWER_CHAPTER_TITLE = re.compile(
 
 # Header mỗi bài: "ĐÁP ÁN TRẮC NGHIỆM BÀI 1"
 SECTION_HEADER = re.compile(
-    r"ĐÁP\s*ÁN\s*TRẮC\s*NGHIỆM\s*BÀI\s*(\d+)",
+    r"ĐÁP\s*ÁN(?:\s*TRẮC\s*NGHIỆM)?(?:\s*CỦA)?\s*BÀI\s*(\d+)",
     re.IGNORECASE,
 )
 
@@ -53,177 +56,366 @@ TONG_ON_HEADER = re.compile(
 
 # Header đề số: "1. Đề số 1" / "2. Đềsố2"
 EXAM_HEADER = re.compile(
-    r"(\d+)\.\s*Đề\s*số\s*(\d+)",
+    r"(?m)^\s*(?:\d+\.\s*)?Đề\s*số\s*(\d+)\b[^\n]*$",
+    re.IGNORECASE,
+)
+
+# Header phần: "Phần 1", "PHẦN II", "Phần A"
+PART_HEADER = re.compile(
+    r"(?m)^\s*(?:\d+\.\s*)?Phần(?:\s+thứ)?\s*"
+    r"(\d+|[IVXLCDM]+|[A-Z])(?:\s*[:.\-–—].*)?\s*$",
     re.IGNORECASE,
 )
 
 # Mỗi entry đáp án: "1. C" / "C. A" / "2. B"
 ANSWER_ENTRY = re.compile(
-    r"([A-Za-z\d]+)\.\s*([A-D])\b",
+    r"(?:Câu\s*)?([A-Za-z\d]+)\s*[.):]\s*([A-D])\b",
+    re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True)
+class AnswerPage:
+    """Text và số trang của một trang thuộc khu vực đáp án."""
+
+    pdf_page: int
+    printed_page: Optional[int]
+    text: str
+
+
+@dataclass
+class AnswerPart:
+    """Một phần/đề có thể được người dùng chọn để tạo Form."""
+
+    key: str
+    label: str
+    answers: list
+    pdf_page_start: int
+    pdf_page_end: int
+    printed_page_start: Optional[int] = None
+    printed_page_end: Optional[int] = None
+    question_start: int = 1
+
+    @property
+    def question_count(self):
+        return len(self.answers)
+
+    @property
+    def question_end(self):
+        return self.question_start + self.question_count - 1
+
+    def page_description(self):
+        """Chuỗi số trang dễ đọc, ưu tiên số trang in trong tài liệu."""
+        printed_range_available = (
+            self.printed_page_start is not None
+            and (
+                self.printed_page_end is not None
+                or self.pdf_page_start == self.pdf_page_end
+            )
+        )
+        if printed_range_available:
+            printed_end = self.printed_page_end or self.printed_page_start
+            printed = _format_range(self.printed_page_start, printed_end)
+            pdf = _format_range(self.pdf_page_start, self.pdf_page_end)
+            if (
+                self.printed_page_start != self.pdf_page_start
+                or printed_end != self.pdf_page_end
+            ):
+                return f"trang {printed} (trang PDF {pdf})"
+            return f"trang {printed}"
+        return f"trang PDF {_format_range(self.pdf_page_start, self.pdf_page_end)}"
+
+
+def _format_range(start, end):
+    return str(start) if start == end else f"{start}-{end}"
 
 
 # ═══════════════════════════════════════════════════════
 #  PDF PARSING
 # ═══════════════════════════════════════════════════════
 
-def list_pdf_files():
-    """Liệt kê các file PDF trong thư mục exam/."""
-    if not os.path.isdir(EXAM_DIR):
-        print(f"❌ Không tìm thấy thư mục: {EXAM_DIR}")
+def list_pdf_files(exam_dir=EXAM_DIR):
+    """Quét đệ quy và trả về đường dẫn tương đối của các PDF trong exam/."""
+    if not os.path.isdir(exam_dir):
+        print(f"❌ Không tìm thấy thư mục: {exam_dir}")
         sys.exit(1)
 
-    pdfs = sorted(
-        f for f in os.listdir(EXAM_DIR) if f.lower().endswith(".pdf")
-    )
+    pdfs = []
+    for current_dir, subdirs, filenames in os.walk(exam_dir):
+        subdirs.sort(key=str.casefold)
+        for filename in sorted(filenames, key=str.casefold):
+            if filename.lower().endswith(".pdf"):
+                full_path = os.path.join(current_dir, filename)
+                pdfs.append(os.path.relpath(full_path, exam_dir))
 
     if not pdfs:
-        print("❌ Không có file PDF nào trong thư mục exam/")
+        print("❌ Không tìm thấy file PDF nào trong thư mục exam/")
         sys.exit(1)
 
-    return pdfs
+    return sorted(pdfs, key=str.casefold)
+
+
+def _extract_printed_page_number(text):
+    """Đọc số trang được in trên tài liệu, nếu nhận diện được."""
+    patterns = (
+        r"(?i)(?:trang|page)\s*[-–—:]?\s*(\d{1,4})\b",
+        r"(?i)HQMATHS\s*[-–—]\s*(\d{1,4})\b",
+        r"(?m)^\s*[-–—]?\s*(\d{1,4})\s*[-–—]?\s*$",
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            return int(matches[-1])
+    return None
+
+
+def extract_answer_pages(pdf_path):
+    """
+    Trích xuất các trang thuộc phần đáp án và giữ metadata số trang.
+
+    Tìm lần xuất hiện cuối của tiêu đề đáp án để tránh mục lục ở đầu PDF.
+    Nếu PDF không có tiêu đề tổng, lấy cụm tiêu đề bài gần cuối tài liệu.
+    """
+    with pdfplumber.open(pdf_path) as pdf:
+        page_texts = [page.extract_text() or "" for page in pdf.pages]
+        total_pages = len(page_texts)
+        chapter_pages = [
+            i for i, text in enumerate(page_texts)
+            if ANSWER_CHAPTER_TITLE.search(text)
+        ]
+
+        if chapter_pages:
+            start_page = chapter_pages[-1]
+        else:
+            section_pages = [
+                i for i, text in enumerate(page_texts)
+                if SECTION_HEADER.search(text) or TONG_ON_HEADER.search(text)
+            ]
+            if not section_pages:
+                return []
+
+            # Lấy cụm đáp án cuối, thay vì chỉ lấy đúng header cuối cùng.
+            last_page = section_pages[-1]
+            maximum_cluster_gap = max(10, total_pages // 5)
+            candidates = [
+                page for page in section_pages
+                if last_page - page <= maximum_cluster_gap
+            ]
+            start_page = min(candidates)
+
+        return [
+            AnswerPage(
+                pdf_page=i + 1,
+                printed_page=_extract_printed_page_number(page_texts[i]),
+                text=page_texts[i],
+            )
+            for i in range(start_page, total_pages)
+        ]
 
 
 def extract_answer_text(pdf_path):
+    """API cũ: trả về text đáp án, không kèm metadata trang."""
+    return "\n".join(page.text for page in extract_answer_pages(pdf_path))
+
+
+def _combine_pages(pages):
+    """Ghép text và trả về offset bắt đầu của từng trang."""
+    chunks = []
+    offsets = []
+    cursor = 0
+    for page in pages:
+        offsets.append(cursor)
+        chunks.append(page.text)
+        cursor += len(page.text) + 1
+    return "\n".join(chunks), offsets
+
+
+def _page_at_position(pages, offsets, position):
+    index = max(0, bisect_right(offsets, position) - 1)
+    return pages[min(index, len(pages) - 1)]
+
+
+def _part_from_matches(key, label, matches, pages, offsets):
+    """Tạo AnswerPart từ danh sách regex match của các đáp án."""
+    start_page = _page_at_position(pages, offsets, matches[0].start())
+    end_page = _page_at_position(pages, offsets, matches[-1].start())
+    prefixes = [match.group(1) for match in matches]
+    question_start = 1
+    if all(prefix.isdigit() for prefix in prefixes):
+        numbers = [int(prefix) for prefix in prefixes]
+        if numbers == list(range(numbers[0], numbers[0] + len(numbers))):
+            question_start = numbers[0]
+
+    return AnswerPart(
+        key=str(key),
+        label=label,
+        answers=[match.group(2).upper() for match in matches],
+        pdf_page_start=start_page.pdf_page,
+        pdf_page_end=end_page.pdf_page,
+        printed_page_start=start_page.printed_page,
+        printed_page_end=end_page.printed_page,
+        question_start=question_start,
+    )
+
+
+def _prefixes_form_contiguous_groups(prefixes):
+    """True nếu mỗi prefix chỉ xuất hiện trong đúng một cụm liên tiếp."""
+    completed = set()
+    previous = None
+    for prefix in prefixes:
+        if prefix != previous:
+            if prefix in completed:
+                return False
+            if previous is not None:
+                completed.add(previous)
+            previous = prefix
+    return True
+
+
+def _parse_implicit_parts(content, content_offset, pages, offsets):
+    """Suy luận phần từ bảng đáp án khi PDF không ghi header phần."""
+    matches = list(ANSWER_ENTRY.finditer(content))
+    if not matches:
+        return OrderedDict()
+
+    # Chuyển match về hệ offset của toàn bộ text để tra cứu số trang.
+    absolute_matches = []
+    for match in matches:
+        absolute_matches.append(_OffsetMatch(match, content_offset))
+
+    prefixes = [match.group(1) for match in matches]
+    unique_prefixes = list(OrderedDict.fromkeys(prefixes))
+
+    # Dạng chuẩn "1.A 2.B 3.C" là số câu, toàn bộ thuộc một phần.
+    # Một prefix chữ lặp lại (thường do ký hiệu trang trí trong PDF) cũng
+    # được xem là một phần duy nhất.
+    if (
+        len(unique_prefixes) == len(prefixes)
+        or len(unique_prefixes) == 1
+        or not _prefixes_form_contiguous_groups(prefixes)
+    ):
+        return OrderedDict({
+            "1": _part_from_matches(
+                "1", "Phần 1", absolute_matches, pages, offsets
+            )
+        })
+
+    # Prefix bị lặp theo nhóm (VD 1,1,...,2,2,...) chính là mã phần.
+    grouped = OrderedDict()
+    for match in absolute_matches:
+        grouped.setdefault(match.group(1), []).append(match)
+
+    parts = OrderedDict()
+    for prefix, group_matches in grouped.items():
+        parts[str(prefix)] = _part_from_matches(
+            prefix,
+            f"Phần {prefix}",
+            group_matches,
+            pages,
+            offsets,
+        )
+    return parts
+
+
+class _OffsetMatch:
+    """Adapter nhỏ để cộng offset vào vị trí của một regex match."""
+
+    def __init__(self, match, offset):
+        self.match = match
+        self.offset = offset
+
+    def start(self):
+        return self.match.start() + self.offset
+
+    def group(self, index):
+        return self.match.group(index)
+
+
+def parse_answer_structure(pages):
     """
-    Trích xuất text từ phần đáp án cuối PDF.
+    Parse đáp án thành ``Bài -> Phần/Đề -> AnswerPart``.
 
-    Tìm trang cuối cùng chứa tiêu đề chương đáp án
-    (để bỏ qua mục lục ở đầu sách) rồi đọc từ đó đến hết.
+    Mỗi phần chứa nhãn, khoảng trang, số câu và danh sách đáp án. Hàm hỗ
+    trợ cả header ``Đề số``, ``Phần`` và bảng chỉ có prefix nhóm.
     """
-    with pdfplumber.open(pdf_path) as pdf:
-        total_pages = len(pdf.pages)
-        start_page = None
+    result = OrderedDict()
+    if not pages:
+        return result
 
-        # Tìm trang CUỐI CÙNG chứa tiêu đề "ĐÁP ÁN TRẮC NGHIỆM CÁC CHỦ ĐỀ"
-        # (trang đầu là mục lục, trang cuối là nội dung thật)
-        for i in range(total_pages - 1, -1, -1):
-            text = pdf.pages[i].extract_text() or ""
-            if ANSWER_CHAPTER_TITLE.search(text):
-                start_page = i
-                break
+    text, page_offsets = _combine_pages(pages)
+    sections = []
+    for match in SECTION_HEADER.finditer(text):
+        sections.append((match.start(), match.end(), int(match.group(1))))
+    next_lesson_number = (
+        max((section[2] for section in sections), default=0) + 1
+    )
+    for match in TONG_ON_HEADER.finditer(text):
+        # Đề tổng ôn đứng sau bài cuối, không giả định cố định là Bài 9.
+        sections.append((match.start(), match.end(), next_lesson_number))
+    sections.sort(key=lambda item: item[0])
 
-        # Fallback: tìm trang cuối có SECTION_HEADER
-        if start_page is None:
-            for i in range(total_pages - 1, -1, -1):
-                text = pdf.pages[i].extract_text() or ""
-                if SECTION_HEADER.search(text):
-                    start_page = i
-                    break
+    for index, (_, header_end, lesson_number) in enumerate(sections):
+        section_end = (
+            sections[index + 1][0] if index + 1 < len(sections) else len(text)
+        )
+        content = text[header_end:section_end]
 
-        if start_page is None:
-            print("❌ Không tìm thấy phần đáp án trong PDF!")
-            sys.exit(1)
+        explicit_headers = []
+        for match in EXAM_HEADER.finditer(content):
+            value = match.group(1)
+            explicit_headers.append(
+                (match.start(), match.end(), f"de-{value}", f"Đề số {value}")
+            )
+        for match in PART_HEADER.finditer(content):
+            value = match.group(1).upper()
+            explicit_headers.append(
+                (match.start(), match.end(), f"phan-{value}", f"Phần {value}")
+            )
+        explicit_headers.sort(key=lambda item: item[0])
 
-        # Đọc từ trang tìm được đến cuối
-        texts = []
-        for i in range(start_page, total_pages):
-            text = pdf.pages[i].extract_text() or ""
-            texts.append(text)
+        lesson_parts = OrderedDict()
+        if explicit_headers:
+            for header_index, (_, part_start, key, label) in enumerate(
+                explicit_headers
+            ):
+                part_end = (
+                    explicit_headers[header_index + 1][0]
+                    if header_index + 1 < len(explicit_headers)
+                    else len(content)
+                )
+                matches = [
+                    _OffsetMatch(match, header_end + part_start)
+                    for match in ANSWER_ENTRY.finditer(
+                        content[part_start:part_end]
+                    )
+                ]
+                if matches:
+                    lesson_parts[key] = _part_from_matches(
+                        key, label, matches, pages, page_offsets
+                    )
+        else:
+            lesson_parts = _parse_implicit_parts(
+                content, header_end, pages, page_offsets
+            )
 
-        return "\n".join(texts)
+        if lesson_parts:
+            result[lesson_number] = lesson_parts
+
+    return result
 
 
 def parse_all_answers(text):
-    """
-    Parse toàn bộ text đáp án thành cấu trúc:
-    {
-        bai_number: {
-            de_number: [list of answer letters],
-            ...
-        },
-        ...
-    }
-    """
+    """API tương thích ngược với cấu trúc ``Bài -> phần -> đáp án`` cũ."""
+    page = AnswerPage(pdf_page=1, printed_page=None, text=text)
+    structure = parse_answer_structure([page])
     result = OrderedDict()
-
-    # ── Tìm các section ──────────────────────────────
-    sections = []
-
-    for m in SECTION_HEADER.finditer(text):
-        bai_num = int(m.group(1))
-        sections.append((m.start(), bai_num))
-
-    for m in TONG_ON_HEADER.finditer(text):
-        # "Đề tổng ôn" = phần cuối cùng, thường là Bài 9
-        sections.append((m.start(), 9))
-
-    sections.sort(key=lambda x: x[0])
-
-    if not sections:
-        return result
-
-    # ── Parse từng section ────────────────────────────
-    for idx, (start_pos, bai_num) in enumerate(sections):
-        end_pos = (
-            sections[idx + 1][0] if idx + 1 < len(sections) else len(text)
-        )
-        section_text = text[start_pos:end_pos]
-
-        # Tìm header nội dung (SECTION_HEADER hoặc TONG_ON_HEADER)
-        header_match = SECTION_HEADER.search(section_text)
-        if not header_match:
-            header_match = TONG_ON_HEADER.search(section_text)
-        if not header_match:
-            continue
-
-        content_after_header = section_text[header_match.end() :]
-
-        # Kiểm tra có "Đề số N" không
-        exam_headers = list(EXAM_HEADER.finditer(content_after_header))
-
-        if exam_headers:
-            # ── Có phân đề ────────────────────────────
-            bai_answers = OrderedDict()
-            for ei, eh in enumerate(exam_headers):
-                de_num = int(eh.group(2))
-                eh_start = eh.end()
-                eh_end = (
-                    exam_headers[ei + 1].start()
-                    if ei + 1 < len(exam_headers)
-                    else len(content_after_header)
-                )
-                exam_text = content_after_header[eh_start:eh_end]
-
-                answers = [
-                    m.group(2).upper()
-                    for m in ANSWER_ENTRY.finditer(exam_text)
-                ]
-                if answers:
-                    bai_answers[de_num] = answers
-
-            if bai_answers:
-                result[bai_num] = bai_answers
-        else:
-            # ── Không có "Đề số" → kiểm tra prefix ───
-            entries = [
-                (m.group(1), m.group(2).upper())
-                for m in ANSWER_ENTRY.finditer(content_after_header)
-            ]
-
-            if not entries:
-                continue
-
-            # Tất cả cùng prefix chữ (VD: "C") → 1 đề duy nhất
-            unique_prefixes = set(p for p, _ in entries)
-            all_same_nonnumeric = (
-                len(unique_prefixes) == 1
-                and not list(unique_prefixes)[0].isdigit()
-            )
-
-            if all_same_nonnumeric:
-                result[bai_num] = OrderedDict(
-                    {1: [letter for _, letter in entries]}
-                )
-            else:
-                # Prefix khác nhau (VD: 1, 2, 3, 4) → nhóm theo prefix
-                bai_answers = OrderedDict()
-                for prefix, letter in entries:
-                    key = int(prefix) if prefix.isdigit() else 1
-                    bai_answers.setdefault(key, []).append(letter)
-                if bai_answers:
-                    result[bai_num] = bai_answers
-
+    for lesson, parts in structure.items():
+        legacy_parts = OrderedDict()
+        for index, part in enumerate(parts.values(), 1):
+            numeric_key = re.search(r"(\d+)$", part.key)
+            key = int(numeric_key.group(1)) if numeric_key else index
+            legacy_parts[key] = part.answers
+        result[lesson] = legacy_parts
     return result
 
 
@@ -253,7 +445,14 @@ def get_local_logo_base64():
     return "", ""
 
 
-def generate_apps_script(title, answers, logo_b64="", logo_mime=""):
+def generate_apps_script(
+    title,
+    answers,
+    logo_b64="",
+    logo_mime="",
+    question_start=1,
+    section_label="Trả lời",
+):
     """
     Sinh code Google Apps Script hoàn chỉnh.
 
@@ -263,6 +462,8 @@ def generate_apps_script(title, answers, logo_b64="", logo_mime=""):
     answers   : list[str] – Danh sách đáp án đúng, VD: ['C', 'A', 'B', ...]
     logo_b64  : str – Base64 của ảnh logo
     logo_mime : str – Mime type của ảnh (vd: image/png)
+    question_start : int – Số thứ tự của câu đầu tiên
+    section_label  : str – Tên phần hiển thị ở trang trả lời
 
     Returns
     -------
@@ -272,11 +473,15 @@ def generate_apps_script(title, answers, logo_b64="", logo_mime=""):
     quiz_data = []
     for i, ans in enumerate(answers):
         quiz_data.append({
-            "question": f"Câu {i + 1}",
+            "question": f"Câu {question_start + i}",
             "answer": ans,
         })
 
     quiz_json = json.dumps(quiz_data, ensure_ascii=False, indent=2)
+    title_json = json.dumps(title, ensure_ascii=False)
+    logo_json = json.dumps(logo_b64)
+    logo_mime_json = json.dumps(logo_mime)
+    section_label_json = json.dumps(section_label, ensure_ascii=False)
 
     gs_code = f'''/**
  * TẠO GOOGLE FORM TRẮC NGHIỆM ABCD
@@ -291,11 +496,12 @@ def generate_apps_script(title, answers, logo_b64="", logo_mime=""):
  * 5. Xem log (Ctrl+Enter hoặc View → Logs) để lấy link Form
  */
 
-const FORM_TITLE = "{title}";
+const FORM_TITLE = {title_json};
 const IS_QUIZ = true;           // true = bật chế độ Quiz (tự chấm điểm)
 const POINTS_PER_QUESTION = 1;  // Mỗi câu 1 điểm
-const LOGO_BASE64 = "{logo_b64}"; // Ảnh mã hóa base64
-const LOGO_MIME = "{logo_mime}";
+const LOGO_BASE64 = {logo_json}; // Ảnh mã hóa base64
+const LOGO_MIME = {logo_mime_json};
+const SECTION_LABEL = {section_label_json};
 
 const QUIZ_DATA = {quiz_json};
 
@@ -326,7 +532,7 @@ function createQuizForm() {{
   
   // Hàm addPageBreakItem() chia trang từ vị trí hiện tại trở về sau
   // Nghĩa là mọi item add sau lệnh này sẽ nằm ở Trang 2
-  form.addPageBreakItem().setTitle("Phần 2: Trả lời");
+  form.addPageBreakItem().setTitle("Phần 2: " + SECTION_LABEL);
 
   // Vòng lặp thêm các câu hỏi trắc nghiệm vào Trang 2
   QUIZ_DATA.forEach(function(q) {{
@@ -406,6 +612,39 @@ def copy_to_clipboard(text):
     return False
 
 
+def ask_number(prompt, minimum, maximum, default=None):
+    """Hỏi một số nguyên trong khoảng, hỗ trợ giá trị mặc định."""
+    while True:
+        try:
+            raw_value = input(prompt).strip()
+            if not raw_value and default is not None:
+                return default
+            value = int(raw_value)
+            if minimum <= value <= maximum:
+                return value
+        except (ValueError, EOFError):
+            pass
+        print(f"❌ Vui lòng nhập số từ {minimum} đến {maximum}!")
+
+
+def choose_pdf_file(pdf_files):
+    """Hiển thị kết quả quét và yêu cầu chọn trước khi đọc nội dung PDF."""
+    print(f"📂 Tìm thấy {len(pdf_files)} file PDF đáp án trong exam/:")
+    for index, relative_path in enumerate(pdf_files, 1):
+        full_path = os.path.join(EXAM_DIR, relative_path)
+        size_mb = os.path.getsize(full_path) / (1024 * 1024)
+        print(f"  {index}. {relative_path} ({size_mb:.1f} MB)")
+
+    print()
+    choice = ask_number(
+        f"📌 Chọn file để quét (1-{len(pdf_files)}) [1]: ",
+        1,
+        len(pdf_files),
+        default=1,
+    )
+    return pdf_files[choice - 1]
+
+
 
 
 # ═══════════════════════════════════════════════════════
@@ -419,97 +658,110 @@ def main():
     print("=" * 55)
     print()
 
-    # ── 1. Chọn file PDF ──────────────────────────────
+    # ── 1. Quét thư mục và chọn file PDF ─────────────
+    print("🔎 Đang quét thư mục exam/...")
     pdfs = list_pdf_files()
-
-    if len(pdfs) == 1:
-        pdf_file = pdfs[0]
-        print(f"📄 File PDF: {pdf_file}")
-    else:
-        print("📂 Chọn file PDF:")
-        for i, f in enumerate(pdfs, 1):
-            name = os.path.splitext(f)[0]
-            print(f"  {i}. {name}")
-        while True:
-            try:
-                choice = int(input("\nNhập số: ").strip())
-                if 1 <= choice <= len(pdfs):
-                    pdf_file = pdfs[choice - 1]
-                    break
-            except (ValueError, EOFError):
-                pass
-            print("❌ Lựa chọn không hợp lệ!")
-
+    pdf_file = choose_pdf_file(pdfs)
     pdf_path = os.path.join(EXAM_DIR, pdf_file)
+    print(f"✅ Đã chọn: {pdf_file}")
     print()
 
+    # Chỉ bắt đầu mở và phân tích PDF sau khi người dùng đã chọn file.
     # ── 2. Parse đáp án ───────────────────────────────
     print("🔍 Đang đọc đáp án từ PDF...")
-    answer_text = extract_answer_text(pdf_path)
-    all_answers = parse_all_answers(answer_text)
+    answer_pages = extract_answer_pages(pdf_path)
+    answer_structure = parse_answer_structure(answer_pages)
 
-    if not all_answers:
+    if not answer_structure:
         print("❌ Không tìm thấy đáp án nào trong PDF!")
         sys.exit(1)
 
-    # ── 3. Hiển thị danh sách bài ─────────────────────
+    # ── 3. Hiển thị cấu trúc bài/phần/trang/câu ──────
     print()
-    print("📋 Các bài có đáp án:")
-    bai_list = list(all_answers.keys())
-    for bai_num in bai_list:
-        de_dict = all_answers[bai_num]
-        de_info = ", ".join(
-            f"Đề {d} ({len(a)} câu)" for d, a in de_dict.items()
-        )
-        print(f"  Bài {bai_num}: {de_info}")
+    print("📋 Cấu trúc đáp án tìm thấy:")
+    lesson_list = list(answer_structure.keys())
+    for lesson_number in lesson_list:
+        print(f"  Bài {lesson_number}:")
+        for part in answer_structure[lesson_number].values():
+            print(
+                f"    • {part.label}: {part.page_description()}, "
+                f"{part.question_count} câu "
+                f"(Câu {part.question_start}-{part.question_end})"
+            )
 
     # ── 4. Nhập số bài ────────────────────────────────
     print()
     while True:
         try:
-            bai_input = int(input("📌 Nhập số bài: ").strip())
-            if bai_input in all_answers:
+            lesson_input = int(input("📌 Chọn bài: ").strip())
+            if lesson_input in answer_structure:
                 break
         except (ValueError, EOFError):
             pass
-        valid = ", ".join(str(b) for b in bai_list)
+        valid = ", ".join(str(lesson) for lesson in lesson_list)
         print(f"❌ Bài không hợp lệ! Chọn: {valid}")
 
-    # ── 5. Nhập đề số ────────────────────────────────
-    de_dict = all_answers[bai_input]
-    de_list = list(de_dict.keys())
-
-    if len(de_list) == 1:
-        de_input = de_list[0]
-        print(f"📌 Đề số: {de_input} (chỉ có 1 đề)")
+    # ── 5. Chọn phần/đề ──────────────────────────────
+    lesson_parts = list(answer_structure[lesson_input].values())
+    if len(lesson_parts) == 1:
+        selected_part = lesson_parts[0]
+        print(f"📌 Phần: {selected_part.label} (chỉ có 1 phần)")
     else:
-        de_options = "/".join(str(d) for d in de_list)
-        while True:
-            try:
-                de_input = int(
-                    input(f"📌 Nhập đề số ({de_options}): ").strip()
-                )
-                if de_input in de_dict:
-                    break
-            except (ValueError, EOFError):
-                pass
-            print(f"❌ Đề không hợp lệ! Chọn: {de_options}")
+        print(f"📚 Các phần của Bài {lesson_input}:")
+        for index, part in enumerate(lesson_parts, 1):
+            print(
+                f"  {index}. {part.label} — {part.page_description()} — "
+                f"{part.question_count} câu "
+                f"(Câu {part.question_start}-{part.question_end})"
+            )
+        part_choice = ask_number(
+            f"📌 Chọn phần (1-{len(lesson_parts)}): ",
+            1,
+            len(lesson_parts),
+        )
+        selected_part = lesson_parts[part_choice - 1]
 
-    answers = de_dict[de_input]
+    # ── 6. Chọn khoảng câu ────────────────────────────
+    total_questions = selected_part.question_count
+    first_question = selected_part.question_start
+    last_question = selected_part.question_end
+    print(
+        f"📄 {selected_part.label}: {selected_part.page_description()}, "
+        f"có {total_questions} câu "
+        f"(Câu {first_question}-{last_question})"
+    )
+    question_from = ask_number(
+        f"📌 Từ câu [{first_question}]: ",
+        first_question,
+        last_question,
+        default=first_question,
+    )
+    question_to = ask_number(
+        f"📌 Đến câu [{last_question}]: ",
+        question_from,
+        last_question,
+        default=last_question,
+    )
+    start_index = question_from - first_question
+    end_index = question_to - first_question + 1
+    answers = selected_part.answers[start_index:end_index]
 
-    # ── 6. Nhập tên form ──────────────────────────────
-    default_title = f"Bài {bai_input} - Đề {de_input}"
+    # ── 7. Nhập tên form ──────────────────────────────
+    default_title = f"Bài {lesson_input} - {selected_part.label}"
+    if question_from != first_question or question_to != last_question:
+        default_title += f" - Câu {question_from}-{question_to}"
     title_input = input(f"📌 Nhập tên form [{default_title}]: ").strip()
     form_title = title_input if title_input else default_title
 
-    # ── 7. Xác nhận ───────────────────────────────────
+    # ── 8. Xác nhận ───────────────────────────────────
     print()
-    print("┌─────────────────────────────────────┐")
-    print(f"│  Bài:      {bai_input:<25}│")
-    print(f"│  Đề:       {de_input:<25}│")
-    print(f"│  Số câu:   {len(answers):<25}│")
-    print(f"│  Tên form: {form_title:<25}│")
-    print("└─────────────────────────────────────┘")
+    print("─" * 55)
+    print(f"  Bài:       {lesson_input}")
+    print(f"  Phần:      {selected_part.label}")
+    print(f"  Vị trí:    {selected_part.page_description()}")
+    print(f"  Chọn câu:  {question_from}-{question_to} ({len(answers)} câu)")
+    print(f"  Tên form:  {form_title}")
+    print("─" * 55)
     print()
 
     # Hiển thị đáp án để kiểm tra
@@ -517,14 +769,26 @@ def main():
     for i in range(0, len(answers), 10):
         chunk = answers[i : i + 10]
         row = "  ".join(
-            f"{i + j + 1:>2}.{a}" for j, a in enumerate(chunk)
+            f"{question_from + i + j:>2}.{a}"
+            for j, a in enumerate(chunk)
         )
         print(f"   {row}")
     print()
 
-    # ── 8. Sinh Apps Script ───────────────────────────
+    # ── 9. Sinh Apps Script ───────────────────────────
     logo_b64, logo_mime = get_local_logo_base64()
-    gs_code = generate_apps_script(form_title, answers, logo_b64, logo_mime)
+    section_label = (
+        f"Bài {lesson_input} - {selected_part.label} "
+        f"(Câu {question_from}-{question_to})"
+    )
+    gs_code = generate_apps_script(
+        form_title,
+        answers,
+        logo_b64,
+        logo_mime,
+        question_start=question_from,
+        section_label=section_label,
+    )
 
     # Lưu file .gs
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -544,7 +808,7 @@ def main():
         print("   📋 Đã copy vào clipboard!")
     print()
 
-    # ── 9. Hướng dẫn ──────────────────────────────────
+    # ── 10. Hướng dẫn ─────────────────────────────────
     print("╔══════════════════════════════════════════════════╗")
     print("║  📌 HƯỚNG DẪN TẠO GOOGLE FORM                  ║")
     print("╠══════════════════════════════════════════════════╣")

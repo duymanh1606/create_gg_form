@@ -8,6 +8,9 @@ Công cụ tự động trích xuất đáp án trắc nghiệm (A, B, C, D) t�
 
 ## 🚀 Tính năng nổi bật
 - **Bóc tách thông minh**: Tự động dò tìm và bóc tách bảng đáp án từ cuối sách PDF.
+- **Nhận diện cấu trúc**: Liệt kê đáp án theo **Bài → Phần/Đề**, kèm khoảng trang và số câu của từng phần.
+- **Quét thư mục trước khi đọc**: Tìm tất cả PDF trong `exam/` và các thư mục con, cho phép chọn file rồi mới bắt đầu phân tích.
+- **Chọn đúng phạm vi cần tạo**: Có thể chọn bài, chọn phần/đề, rồi chọn từ câu nào đến câu nào.
 - **Form 2 trang chuyên nghiệp**: Tự động chia form làm 2 phần: Trang 1 (Logo & Họ tên học sinh), Trang 2 (Bài kiểm tra).
 - **Nhúng Logo tự động**: Chỉ cần bỏ file ảnh vào thư mục, tool sẽ tự mã hoá và chèn ảnh thẳng vào đầu form mà không cần qua Google Drive.
 - **Tự động chấm điểm**: Bật sẵn chế độ Quiz (bài kiểm tra), set 1 điểm/câu và cài sẵn đáp án đúng.
@@ -42,7 +45,10 @@ Công cụ tự động trích xuất đáp án trắc nghiệm (A, B, C, D) t�
    python create_form.py
    ```
 3. Script sẽ hỏi bạn một số thông tin, hãy làm theo hướng dẫn:
-   - Chọn bài / Chọn đề.
+   - Xem danh sách PDF tìm thấy trong `exam/` và chọn file cần quét.
+   - Xem toàn bộ cấu trúc mà công cụ nhận diện: bài, phần/đề, khoảng trang và số câu.
+   - Chọn bài, chọn phần/đề.
+   - Chọn câu bắt đầu và câu kết thúc (nhấn Enter để lấy toàn bộ phần).
    - Nhập tên Form muốn tạo (VD: *Kiểm tra 15 phút Toán*).
 4. Tool báo thành công và sinh ra một file code ở thư mục `output/` (ví dụ: `output/Kiem_tra_Toan.gs`). Code này cũng đã được **tự động copy vào bộ nhớ đệm (clipboard)** của máy tính.
 
